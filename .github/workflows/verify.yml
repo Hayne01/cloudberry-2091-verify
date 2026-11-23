@@ -117,10 +117,28 @@ jobs:
         su - gpadmin -c "SRC_DIR=${SRC_DIR} TOOLS_DIR=${TOOLS_DIR} bash ${TOOLS_DIR}/run-repro.sh repro.sql rb_before ${RESULTS_DIR}/before_repro.log"
         su - gpadmin -c "SRC_DIR=${SRC_DIR} TOOLS_DIR=${TOOLS_DIR} bash ${TOOLS_DIR}/run-repro.sh check.sql cb_before ${RESULTS_DIR}/before_check.log"
 
-    - name: Apply fix to contrib/pax_storage
+    - name: Install PAX regress harness deps
       run: |
         set -eo pipefail
-        su - gpadmin -c "cd ${SRC_DIR} && git config --global --add safe.directory ${SRC_DIR} && git apply --verbose ${TOOLS_DIR}/fix.patch && echo '=== applied region ===' && sed -n '605,635p' contrib/pax_storage/src/cpp/storage/pax.cc"
+        su - gpadmin -c "cd ${SRC_DIR} && make -j\$(nproc) -C src/test/regress && make -C src/test/regress install && make -C contrib/gp_inject_fault install && make -C contrib/pax_storage regress_link"
+
+    - name: Add #2091 regression test (test-only, no code fix yet)
+      run: |
+        set -eo pipefail
+        su - gpadmin -c "cd ${SRC_DIR} && git config --global --add safe.directory ${SRC_DIR} && git apply --verbose --include='contrib/pax_storage/sql/delete_null_stats.sql' --include='contrib/pax_storage/expected/delete_null_stats.out' --include='contrib/pax_storage/pax_schedule' ${TOOLS_DIR}/fix.patch && echo '=== schedule now ===' && grep -n delete_null_stats contrib/pax_storage/pax_schedule"
+
+    - name: PAX suite BASELINE (unpatched code, new test present)
+      run: |
+        set -uo pipefail
+        su - gpadmin -c "source /usr/local/cloudberry-db/cloudberry-env.sh && source ${SRC_DIR}/gpAux/gpdemo/gpdemo-env.sh && cd ${SRC_DIR}/contrib/pax_storage && make pax-test" > "${RESULTS_DIR}/pax_suite_baseline.log" 2>&1 || true
+        su - gpadmin -c "cd ${SRC_DIR}/contrib/pax_storage && cp -f regression.diffs ${RESULTS_DIR}/pax_suite_baseline.diffs 2>/dev/null; mkdir -p ${RESULTS_DIR}/baseline_results && cp -f results/*.out ${RESULTS_DIR}/baseline_results/ 2>/dev/null; true"
+        echo "=== baseline tail ==="; tail -n 40 "${RESULTS_DIR}/pax_suite_baseline.log" || true
+        echo "=== baseline FAILED tests ==="; grep -E 'FAILED' "${RESULTS_DIR}/pax_suite_baseline.log" || true
+
+    - name: Apply code fix to contrib/pax_storage
+      run: |
+        set -eo pipefail
+        su - gpadmin -c "cd ${SRC_DIR} && git apply --verbose --include='contrib/pax_storage/src/cpp/storage/pax.cc' ${TOOLS_DIR}/fix.patch && echo '=== applied region ===' && sed -n '605,640p' contrib/pax_storage/src/cpp/storage/pax.cc"
 
     - name: Rebuild contrib/pax_storage only (fast)
       run: |
@@ -139,6 +157,49 @@ jobs:
         set -eo pipefail
         su - gpadmin -c "SRC_DIR=${SRC_DIR} TOOLS_DIR=${TOOLS_DIR} bash ${TOOLS_DIR}/run-repro.sh repro.sql ra_after ${RESULTS_DIR}/after_repro.log"
         su - gpadmin -c "SRC_DIR=${SRC_DIR} TOOLS_DIR=${TOOLS_DIR} bash ${TOOLS_DIR}/run-repro.sh check.sql ca_after ${RESULTS_DIR}/after_check.log"
+
+    - name: PAX suite PATCHED (code fix applied)
+      run: |
+        set -uo pipefail
+        su - gpadmin -c "source /usr/local/cloudberry-db/cloudberry-env.sh && source ${SRC_DIR}/gpAux/gpdemo/gpdemo-env.sh && cd ${SRC_DIR}/contrib/pax_storage && make pax-test" > "${RESULTS_DIR}/pax_suite_patched.log" 2>&1 || true
+        su - gpadmin -c "cd ${SRC_DIR}/contrib/pax_storage && cp -f regression.diffs ${RESULTS_DIR}/pax_suite_patched.diffs 2>/dev/null; mkdir -p ${RESULTS_DIR}/patched_results && cp -f results/*.out ${RESULTS_DIR}/patched_results/ 2>/dev/null; true"
+        echo "=== patched tail ==="; tail -n 40 "${RESULTS_DIR}/pax_suite_patched.log" || true
+        echo "=== patched FAILED tests ==="; grep -E 'FAILED' "${RESULTS_DIR}/pax_suite_patched.log" || true
+
+    - name: Assert PAX suite no-regression
+      run: |
+        set -uo pipefail
+        cd "${RESULTS_DIR}"
+        # Extract failed test names from pg_regress "test <name> ... FAILED" lines.
+        grep -E '\.\.\. FAILED' pax_suite_baseline.log | sed -E 's/^test +([^ ]+).*/\1/' | sort -u > baseline_failed.txt || true
+        grep -E '\.\.\. FAILED' pax_suite_patched.log  | sed -E 's/^test +([^ ]+).*/\1/' | sort -u > patched_failed.txt || true
+        echo "=== baseline failed ==="; cat baseline_failed.txt
+        echo "=== patched failed ==="; cat patched_failed.txt
+        ok=1
+        if ! grep -qx delete_null_stats baseline_failed.txt; then
+          echo "::error::New test delete_null_stats did NOT fail on unpatched code (expected to reproduce #2091)."; ok=0
+        fi
+        if grep -qx delete_null_stats patched_failed.txt; then
+          echo "::error::delete_null_stats still fails after fix."; ok=0
+        fi
+        # No new failures introduced by the fix.
+        while read -r t; do
+          [ -z "$t" ] && continue
+          if ! grep -qx "$t" baseline_failed.txt; then
+            echo "::error::New regression in PAX suite after fix: $t"; ok=0
+          fi
+        done < patched_failed.txt
+        {
+          echo "## PAX regression suite (pax_schedule)"
+          echo "- baseline (unpatched) failed: $(tr '\n' ' ' < baseline_failed.txt)"
+          echo "- patched failed: $(tr '\n' ' ' < patched_failed.txt)"
+        } >> "$GITHUB_STEP_SUMMARY"
+        if [ "$ok" = "1" ]; then
+          echo "PASS: delete_null_stats reproduces #2091 before fix, passes after, no new suite regressions." | tee -a "$GITHUB_STEP_SUMMARY"
+        else
+          echo "FAIL: PAX suite no-regression assertion failed." >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+        fi
 
     - name: Assert before/after contrast
       run: |
