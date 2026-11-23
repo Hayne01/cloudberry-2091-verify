@@ -1,0 +1,30 @@
+diff --git a/contrib/pax_storage/src/cpp/storage/pax.cc b/contrib/pax_storage/src/cpp/storage/pax.cc
+index 7edeba9..55ff352 100644
+--- a/contrib/pax_storage/src/cpp/storage/pax.cc
++++ b/contrib/pax_storage/src/cpp/storage/pax.cc
+@@ -611,11 +611,20 @@ void TableDeleter::DeleteWithVisibilityMap(
+   min_max_col_idxs = cbdb::GetMinMaxColumnIndexes(rel_);
+   bf_col_idxs = cbdb::GetBloomFilterColumnIndexes(rel_);
+ 
+-  // Projection must cover minmax ∪ bloomfilter columns; otherwise
+-  // AddRow reads uninitialized slot values for bf columns (issue #1749).
+-  std::set_union(min_max_col_idxs.begin(), min_max_col_idxs.end(),
+-                 bf_col_idxs.begin(), bf_col_idxs.end(),
+-                 std::back_inserter(stats_proj_col_idxs));
++  // MicroPartitionStats::AddRow maintains null counts (hasnull / allnull /
++  // nonnullrows) for EVERY column by reading slot->tts_isnull[i] for all i,
++  // not just the minmax / bloomfilter columns. The recompute reader must
++  // therefore load every column. A projection restricted to minmax union
++  // bloomfilter columns leaves the remaining columns unloaded: OrcGroup
++  // takes the CTID-only read path and never fills their tts_isnull, which
++  // stays at its initial false. The recomputed stats then claim hasnull=false
++  // for an all-NULL column, and the sparse filter drops the whole block for
++  // "IS NULL" after a DELETE (issue #2091). Cover all attributes so that
++  // SetColumnProjection clears the projection and reads every column. This
++  // also subsumes the issue #1749 fix (minmax / bloomfilter columns covered).
++  for (int i = 0; i < rel_->rd_att->natts; i++) {
++    stats_proj_col_idxs.push_back(i);
++  }
+   stats_updater_projection->SetColumnProjection(stats_proj_col_idxs,
+                                                 rel_->rd_att->natts);
+   do {
