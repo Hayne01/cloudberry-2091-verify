@@ -120,9 +120,7 @@ jobs:
     - name: Apply fix to contrib/pax_storage
       run: |
         set -eo pipefail
-        cd "${SRC_DIR}"
-        git apply --verbose "${TOOLS_DIR}/fix.patch"
-        git -C "${SRC_DIR}" diff --stat
+        su - gpadmin -c "cd ${SRC_DIR} && git config --global --add safe.directory ${SRC_DIR} && git apply --verbose ${TOOLS_DIR}/fix.patch && echo '=== applied region ===' && sed -n '605,635p' contrib/pax_storage/src/cpp/storage/pax.cc"
 
     - name: Rebuild contrib/pax_storage only (fast)
       run: |
