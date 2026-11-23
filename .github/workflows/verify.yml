@@ -120,7 +120,7 @@ jobs:
     - name: Install PAX regress harness deps
       run: |
         set -eo pipefail
-        su - gpadmin -c "cd ${SRC_DIR} && make -j\$(nproc) -C src/test/regress && make -C src/test/regress install && make -C contrib/gp_inject_fault install && make -C contrib/pax_storage regress_link"
+        su - gpadmin -c "cd ${SRC_DIR} && make -j\$(nproc) -C src/test/regress && make -C src/test/regress install && make -C gpcontrib/gp_inject_fault install && make -C contrib/pax_storage regress_link"
 
     - name: Add #2091 regression test (test-only, no code fix yet)
       run: |
