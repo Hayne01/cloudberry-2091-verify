@@ -1,0 +1,180 @@
+name: Verify cloudberry#2091 (PAX IS NULL after DELETE)
+
+# Scratch runtime verification ONLY. Builds apache/cloudberry@main with
+# assertions, runs the issue #2091 reproducer BEFORE the fix, applies the
+# fix, rebuilds contrib/pax_storage, restarts the cluster, and runs the
+# reproducer AFTER the fix. Uploads before/after logs as artifacts.
+# This workflow never commits to or opens a PR against apache/cloudberry.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-2091-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    container:
+      image: apache/incubator-cloudberry:cbdb-build-rocky9-latest
+      options: >-
+        --privileged
+        --user root
+        --hostname cdw
+        --shm-size=2gb
+        --ulimit core=0
+        -v /usr/share:/host_usr_share
+        -v /usr/local:/host_usr_local
+        -v /opt:/host_opt
+
+    steps:
+    - name: Free Disk Space
+      run: |
+        df -h /
+        rm -rf /host_opt/hostedtoolcache || true
+        rm -rf /host_usr_local/lib/android || true
+        rm -rf /host_usr_share/dotnet || true
+        rm -rf /host_opt/ghc || true
+        rm -rf /host_usr_local/.ghcup || true
+        rm -rf /host_usr_share/swift || true
+        rm -rf /host_usr_local/share/powershell || true
+        rm -rf /host_usr_local/share/chromium || true
+        rm -rf /host_usr_share/miniconda || true
+        rm -rf /host_opt/az || true
+        rm -rf /host_usr_share/sbt || true
+        df -h /
+
+    - name: Checkout apache/cloudberry (main)
+      uses: actions/checkout@v4
+      with:
+        repository: apache/cloudberry
+        ref: main
+        path: cloudberry
+        submodules: true
+        fetch-depth: 1
+
+    - name: Checkout verification tools (this repo)
+      uses: actions/checkout@v4
+      with:
+        path: tools
+
+    - name: Resolve parameters
+      run: |
+        set -euo pipefail
+        {
+          echo "SRC_DIR=${GITHUB_WORKSPACE}/cloudberry"
+          echo "TOOLS_DIR=${GITHUB_WORKSPACE}/tools"
+          echo "RESULTS_DIR=${GITHUB_WORKSPACE}/results"
+        } | tee -a "$GITHUB_ENV"
+        echo "cloudberry main commit: $(git -C cloudberry rev-parse HEAD)" | tee -a "$GITHUB_ENV"
+        git -C cloudberry rev-parse HEAD > "${GITHUB_WORKSPACE}/cloudberry-sha.txt"
+
+    - name: Cloudberry Environment Initialization
+      run: |
+        set -eo pipefail
+        if ! su - gpadmin -c "/tmp/init_system.sh"; then
+          echo "::error::Container initialization failed"; exit 1
+        fi
+        mkdir -p "${RESULTS_DIR}" cloudberry/build-logs
+        chown -R gpadmin:gpadmin .
+        chmod -R 755 .
+        df -h /
+        free -h
+
+    - name: Configure (assertions on)
+      run: |
+        set -eo pipefail
+        if ! time su - gpadmin -c "cd ${SRC_DIR} && SRC_DIR=${SRC_DIR} ENABLE_DEBUG=true ${SRC_DIR}/devops/build/automation/cloudberry/scripts/configure-cloudberry.sh"; then
+          echo "::error::Configure failed"; exit 1
+        fi
+
+    - name: Build (full, unpatched main)
+      run: |
+        set -eo pipefail
+        if ! time su - gpadmin -c "cd ${SRC_DIR} && SRC_DIR=${SRC_DIR} ${SRC_DIR}/devops/build/automation/cloudberry/scripts/build-cloudberry.sh"; then
+          echo "::error::Build failed"; exit 1
+        fi
+
+    - name: Create demo cluster (no mirrors)
+      run: |
+        set -eo pipefail
+        if ! time su - gpadmin -c "cd ${SRC_DIR} && WITH_MIRRORS=false BLDWRAP_POSTGRES_CONF_ADDONS=log_statement=none SRC_DIR=${SRC_DIR} ${SRC_DIR}/devops/build/automation/cloudberry/scripts/create-cloudberry-demo-cluster.sh"; then
+          echo "::error::Cluster creation failed"; exit 1
+        fi
+
+    - name: BEFORE fix - run reproducer
+      run: |
+        set -eo pipefail
+        su - gpadmin -c "SRC_DIR=${SRC_DIR} TOOLS_DIR=${TOOLS_DIR} bash ${TOOLS_DIR}/run-repro.sh repro.sql rb_before ${RESULTS_DIR}/before_repro.log"
+        su - gpadmin -c "SRC_DIR=${SRC_DIR} TOOLS_DIR=${TOOLS_DIR} bash ${TOOLS_DIR}/run-repro.sh check.sql cb_before ${RESULTS_DIR}/before_check.log"
+
+    - name: Apply fix to contrib/pax_storage
+      run: |
+        set -eo pipefail
+        cd "${SRC_DIR}"
+        git apply --verbose "${TOOLS_DIR}/fix.patch"
+        git -C "${SRC_DIR}" diff --stat
+
+    - name: Rebuild contrib/pax_storage only (fast)
+      run: |
+        set -eo pipefail
+        if ! time su - gpadmin -c "cd ${SRC_DIR} && SRC_DIR=${SRC_DIR} make -j\$(nproc) -C ${SRC_DIR}/contrib/pax_storage && make -C ${SRC_DIR}/contrib/pax_storage install"; then
+          echo "::error::pax_storage rebuild failed"; exit 1
+        fi
+
+    - name: Restart cluster to load rebuilt pax.so
+      run: |
+        set -eo pipefail
+        su - gpadmin -c "source /usr/local/cloudberry-db/cloudberry-env.sh && source ${SRC_DIR}/gpAux/gpdemo/gpdemo-env.sh && gpstop -a -M fast && gpstart -a && gpstate"
+
+    - name: AFTER fix - run reproducer
+      run: |
+        set -eo pipefail
+        su - gpadmin -c "SRC_DIR=${SRC_DIR} TOOLS_DIR=${TOOLS_DIR} bash ${TOOLS_DIR}/run-repro.sh repro.sql ra_after ${RESULTS_DIR}/after_repro.log"
+        su - gpadmin -c "SRC_DIR=${SRC_DIR} TOOLS_DIR=${TOOLS_DIR} bash ${TOOLS_DIR}/run-repro.sh check.sql ca_after ${RESULTS_DIR}/after_check.log"
+
+    - name: Assert before/after contrast
+      run: |
+        set -uo pipefail
+        cd "${RESULTS_DIR}"
+        echo "=== BEFORE (sparse on) ==="; grep sparse_on_isnull_count before_check.log || true
+        echo "=== AFTER  (sparse on) ==="; grep sparse_on_isnull_count after_check.log || true
+        b=$(grep 'sparse_on_isnull_count *|' before_check.log | grep -Eo '[0-9]+' | head -1)
+        a=$(grep 'sparse_on_isnull_count *|' after_check.log | grep -Eo '[0-9]+' | head -1)
+        echo "before_count='${b}' after_count='${a}'"
+        {
+          echo "# cloudberry#2091 runtime verification"
+          echo
+          echo "- apache/cloudberry main commit: $(cat ${GITHUB_WORKSPACE}/cloudberry-sha.txt)"
+          echo "- debug build with assertions, demo cluster without mirrors"
+          echo
+          echo "| phase | WHERE c0 IS NULL (sparse on) | expected |"
+          echo "|---|---|---|"
+          echo "| BEFORE fix | ${b} | 0 (bug) |"
+          echo "| AFTER fix  | ${a} | 2 (fixed) |"
+        } >> "$GITHUB_STEP_SUMMARY"
+        if [ "${b}" = "0" ] && [ "${a}" = "2" ]; then
+          echo "PASS: bug reproduced before fix (0) and gone after fix (2)." | tee -a "$GITHUB_STEP_SUMMARY"
+        else
+          echo "::error::Contrast not as expected (before='${b}', after='${a}'). See logs."
+          echo "FAIL: before='${b}' after='${a}'" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+        fi
+
+    - name: Upload logs
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: verify-2091-logs
+        path: |
+          results/
+          cloudberry/build-logs/
+          cloudberry-sha.txt
+        retention-days: 30
