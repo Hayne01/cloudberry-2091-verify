@@ -68,13 +68,15 @@ jobs:
     - name: Resolve parameters
       run: |
         set -euo pipefail
+        sha=$(git -C cloudberry rev-parse HEAD)
         {
           echo "SRC_DIR=${GITHUB_WORKSPACE}/cloudberry"
           echo "TOOLS_DIR=${GITHUB_WORKSPACE}/tools"
           echo "RESULTS_DIR=${GITHUB_WORKSPACE}/results"
+          echo "CLOUDBERRY_SHA=${sha}"
         } | tee -a "$GITHUB_ENV"
-        echo "cloudberry main commit: $(git -C cloudberry rev-parse HEAD)" | tee -a "$GITHUB_ENV"
-        git -C cloudberry rev-parse HEAD > "${GITHUB_WORKSPACE}/cloudberry-sha.txt"
+        echo "cloudberry main commit: ${sha}"
+        printf '%s\n' "${sha}" > "${GITHUB_WORKSPACE}/cloudberry-sha.txt"
 
     - name: Cloudberry Environment Initialization
       run: |
